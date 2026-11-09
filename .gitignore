@@ -1,0 +1,35 @@
+# .NET
+bin/
+obj/
+*.user
+*.userosscache
+*.suo
+*.userprefs
+TestResults/
+.vs/
+*.dotCover
+
+# Node / Frontend
+node_modules/
+dist/
+dist-ssr/
+*.local
+.npm
+.yarn/
+package-lock.json.backup
+
+# Env files (keep example only)
+.env
+.env*.local
+!.env.example
+
+# Logs & OS
+*.log
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Docker / Postgres data
+pgdata/
+docker-data/
+scratch/

@@ -1,6 +1,7 @@
 using System.Diagnostics;
 using System.Net;
 using System.Net.Sockets;
+using System.Text;
 using AdmissionSystem.Infrastructure.Persistence;
 using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.Mvc.Testing;
@@ -13,12 +14,44 @@ namespace AdmissionSystem.IntegrationTests.Infrastructure;
 public sealed class ExternalApiProcessHandle : IAsyncDisposable
 {
     private readonly Process _process;
+    private readonly StringBuilder _stdoutBuffer = new();
+    private readonly StringBuilder _stderrBuffer = new();
+    private readonly object _outputLock = new();
+
     public Uri BaseUri { get; }
+    public int ProcessId => _process.Id;
+    public int Port => BaseUri.Port;
 
     private ExternalApiProcessHandle(Process process, Uri baseUri)
     {
         _process = process;
         BaseUri = baseUri;
+
+        // Safely consume redirected standard output and error asynchronously to prevent OS pipe buffer deadlocks.
+        _process.OutputDataReceived += (_, args) =>
+        {
+            if (args.Data is not null)
+            {
+                lock (_outputLock)
+                {
+                    _stdoutBuffer.AppendLine(args.Data);
+                }
+            }
+        };
+
+        _process.ErrorDataReceived += (_, args) =>
+        {
+            if (args.Data is not null)
+            {
+                lock (_outputLock)
+                {
+                    _stderrBuffer.AppendLine(args.Data);
+                }
+            }
+        };
+
+        _process.BeginOutputReadLine();
+        _process.BeginErrorReadLine();
     }
 
     public static async Task<ExternalApiProcessHandle> StartAsync(
@@ -47,6 +80,8 @@ public sealed class ExternalApiProcessHandle : IAsyncDisposable
         psi.Environment["ConnectionStrings__Default"] = connectionString;
         psi.Environment["HOLD_DURATION_SECONDS"] = holdDurationSeconds.ToString();
         psi.Environment["SKIP_MIGRATIONS"] = "true";
+        // Budget 40 connections per API process to keep 2 processes + runner within PostgreSQL 100 max_connections
+        psi.Environment["MAX_POOL_SIZE"] = "40";
 
         var process = Process.Start(psi)
             ?? throw new InvalidOperationException("Failed to start external dotnet API process.");
@@ -73,10 +108,14 @@ public sealed class ExternalApiProcessHandle : IAsyncDisposable
         {
             if (_process.HasExited)
             {
-                var stderr = await _process.StandardError.ReadToEndAsync();
-                var stdout = await _process.StandardOutput.ReadToEndAsync();
+                string stderr, stdout;
+                lock (_outputLock)
+                {
+                    stderr = _stderrBuffer.ToString();
+                    stdout = _stdoutBuffer.ToString();
+                }
                 throw new InvalidOperationException(
-                    $"External API process exited prematurely with code {_process.ExitCode}. StdErr: {stderr} StdOut: {stdout}");
+                    $"External API process (PID {ProcessId}) exited prematurely with code {_process.ExitCode}. StdErr: {stderr} StdOut: {stdout}");
             }
 
             try
@@ -141,7 +180,8 @@ public sealed class PostgresDatabaseFixture : IAsyncLifetime
         }
         else
         {
-            var postgresImage = Environment.GetEnvironmentVariable("TESTCONTAINERS_POSTGRES_IMAGE") ?? "postgres:15-alpine";
+            // Aligns with the planned Docker environment by using PostgreSQL 17 as the default image.
+            var postgresImage = Environment.GetEnvironmentVariable("TESTCONTAINERS_POSTGRES_IMAGE") ?? "postgres:17-alpine";
             _postgresContainer = new PostgreSqlBuilder(postgresImage)
                 .WithDatabase("admission_test_db")
                 .WithUsername("postgres")
@@ -172,6 +212,7 @@ public sealed class PostgresDatabaseFixture : IAsyncLifetime
                 builder.UseSetting("ConnectionStrings:Default", ConnectionString);
                 builder.UseSetting("HOLD_DURATION_SECONDS", holdDurationSeconds.ToString());
                 builder.UseSetting("SKIP_MIGRATIONS", "true");
+                builder.UseSetting("MAX_POOL_SIZE", "40");
             });
     }
 

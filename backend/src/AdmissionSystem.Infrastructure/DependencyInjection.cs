@@ -43,6 +43,8 @@ public static class DependencyInjection
 
     public static string ResolveConnectionString(IConfiguration configuration)
     {
+        // Primary documented configuration is ConnectionStrings__Default (or ConnectionStrings:Default).
+        // Fallbacks for common container/cloud environment variables are checked subsequently.
         var raw =
             configuration.GetConnectionString("Default") ??
             configuration["DATABASE_CONNECTION_STRING"] ??
@@ -51,13 +53,23 @@ public static class DependencyInjection
 
         if (string.IsNullOrWhiteSpace(raw))
         {
-            return "Host=localhost;Port=5432;Database=admission_db;Username=postgres;Password=postgres";
+            raw = "Host=localhost;Port=5432;Database=admission_db;Username=postgres;Password=postgres";
         }
 
-        return NormalizeConnectionString(raw.Trim());
+        int? configuredMaxPoolSize = null;
+        if (int.TryParse(configuration["MAX_POOL_SIZE"], out var parsedPool) && parsedPool > 0)
+        {
+            configuredMaxPoolSize = parsedPool;
+        }
+
+        return NormalizeConnectionString(raw.Trim(), configuredMaxPoolSize);
     }
 
-    public static string NormalizeConnectionString(string raw)
+    /// <summary>
+    /// Normalizes connection strings: parses postgres:// and postgresql:// URIs if provided,
+    /// and configures connection pooling budget without altering explicitly user-supplied settings.
+    /// </summary>
+    public static string NormalizeConnectionString(string raw, int? defaultMaxPoolSize = null)
     {
         NpgsqlConnectionStringBuilder builder;
 
@@ -104,13 +116,20 @@ public static class DependencyInjection
             builder = new NpgsqlConnectionStringBuilder(raw);
         }
 
-        // PostgreSQL default max_connections is 100. When running multiple backend processes
-        // sharing a single PostgreSQL server under heavy concurrency, cap each process's pool
-        // at 40 so two processes + test runner never exceed PostgreSQL's 100-connection ceiling.
-        if (!raw.Contains("Maximum Pool Size", StringComparison.OrdinalIgnoreCase) &&
-            !raw.Contains("MaxPoolSize", StringComparison.OrdinalIgnoreCase))
+        // Check if caller explicitly supplied pool size in the connection string using Npgsql properties
+        // instead of raw substring matching.
+        var hasExplicitPoolSize = builder.ContainsKey("Maximum Pool Size") || builder.ContainsKey("MaxPoolSize");
+
+        // Connection budget rationale:
+        // PostgreSQL's default max_connections is 100 (97 usable by non-superusers).
+        // For standard single-instance deployments, Npgsql's default MaxPoolSize (100) is preserved.
+        // For multi-process deployments sharing one DB (e.g. 2 API processes + test runner),
+        // each process should budget ~40 connections (40 + 40 + 15 = 95 <= 100) to prevent
+        // 'sorry, too many clients already' connection exhaustion.
+        // We only apply defaultMaxPoolSize if explicitly requested and the connection string did not specify one.
+        if (!hasExplicitPoolSize && defaultMaxPoolSize.HasValue && defaultMaxPoolSize.Value > 0)
         {
-            builder.MaxPoolSize = 40;
+            builder.MaxPoolSize = defaultMaxPoolSize.Value;
         }
 
         return builder.ConnectionString;

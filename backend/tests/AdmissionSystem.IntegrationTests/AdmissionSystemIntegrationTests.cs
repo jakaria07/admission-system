@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using System.Net;
 using System.Net.Http.Json;
 using System.Text;
@@ -7,6 +8,7 @@ using AdmissionSystem.Infrastructure;
 using AdmissionSystem.IntegrationTests.Infrastructure;
 using FluentAssertions;
 using Npgsql;
+using Xunit.Abstractions;
 
 namespace AdmissionSystem.IntegrationTests;
 
@@ -14,10 +16,12 @@ namespace AdmissionSystem.IntegrationTests;
 public sealed class AdmissionSystemIntegrationTests
 {
     private readonly PostgresDatabaseFixture _fixture;
+    private readonly ITestOutputHelper _output;
 
-    public AdmissionSystemIntegrationTests(PostgresDatabaseFixture fixture)
+    public AdmissionSystemIntegrationTests(PostgresDatabaseFixture fixture, ITestOutputHelper output)
     {
         _fixture = fixture;
+        _output = output;
     }
 
     [Fact]
@@ -130,20 +134,31 @@ public sealed class AdmissionSystemIntegrationTests
         immediateClass!.AvailableSeats.Should().Be(0);
         immediateClass.HeldSeats.Should().Be(1);
 
-        // Wait for hold duration (2s) to elapse
-        await Task.Delay(TimeSpan.FromMilliseconds(2600));
+        // Wait for hold duration (2s) to elapse using timeout-based polling (up to 10s timeout, polling every 200ms)
+        var pollTimeout = TimeSpan.FromSeconds(10);
+        var sw = Stopwatch.StartNew();
+        HoldDetailsResponseDto? holdDetails = null;
+
+        while (sw.Elapsed < pollTimeout)
+        {
+            holdDetails = await adminClient.GetFromJsonAsync<HoldDetailsResponseDto>($"/holds/{hold!.HoldId}");
+            if (holdDetails?.Status == "EXPIRED")
+            {
+                break;
+            }
+            await Task.Delay(200);
+        }
+
+        holdDetails.Should().NotBeNull();
+        holdDetails!.Status.Should().Be("EXPIRED", $"Hold must transition to EXPIRED within {pollTimeout.TotalSeconds}s.");
 
         // Without any write API call, GET /classes/{classId} must show seat returned (Available = 1, Held = 0)
         var afterExpiryClass = await adminClient.GetFromJsonAsync<ClassSummaryResponseDto>($"/classes/{classId}");
         afterExpiryClass!.HeldSeats.Should().Be(0);
         afterExpiryClass.AvailableSeats.Should().Be(1);
 
-        // GET /holds/{holdId} must show EXPIRED
-        var holdDetails = await adminClient.GetFromJsonAsync<HoldDetailsResponseDto>($"/holds/{hold!.HoldId}");
-        holdDetails!.Status.Should().Be("EXPIRED");
-
         // Attempting to confirm expired hold must return 409 Conflict
-        var confirmExpiredResp = await studentClient.PostAsync($"/holds/{hold.HoldId}/confirm", content: null);
+        var confirmExpiredResp = await studentClient.PostAsync($"/holds/{hold!.HoldId}/confirm", content: null);
         confirmExpiredResp.StatusCode.Should().Be(HttpStatusCode.Conflict);
 
         // Same student can re-apply now that previous hold expired
@@ -184,11 +199,17 @@ public sealed class AdmissionSystemIntegrationTests
         barrier.Release(concurrentRequests);
         var responses = await Task.WhenAll(tasks);
 
+        // Strengthened assertions: exactly 100 responses and strictly 201 or 409
+        responses.Length.Should().Be(concurrentRequests, "Exactly 100 HTTP responses must be received.");
+        responses.Should().OnlyContain(
+            r => r.StatusCode == HttpStatusCode.Created || r.StatusCode == HttpStatusCode.Conflict,
+            "Every response must be either 201 Created or 409 Conflict (no 500s or unexpected errors).");
+
         var createdCount = responses.Count(r => r.StatusCode == HttpStatusCode.Created);
         var conflictCount = responses.Count(r => r.StatusCode == HttpStatusCode.Conflict);
 
-        createdCount.Should().Be(totalSeats);
-        conflictCount.Should().Be(concurrentRequests - totalSeats);
+        createdCount.Should().Be(totalSeats, "Exactly totalSeats (10) hold requests must succeed.");
+        conflictCount.Should().Be(concurrentRequests - totalSeats, "All excess requests (90) must receive 409 Conflict.");
 
         var finalClass = await adminClient.GetFromJsonAsync<ClassSummaryResponseDto>($"/classes/{classId}");
         finalClass!.HeldSeats.Should().Be(totalSeats);
@@ -250,6 +271,22 @@ public sealed class AdmissionSystemIntegrationTests
 
         var finalHold = await adminClient.GetFromJsonAsync<HoldDetailsResponseDto>($"/holds/{hold!.HoldId}");
         finalHold!.Status.Should().Be(confirmWon ? "CONFIRMED" : "CANCELLED");
+
+        // Verify that final database seat counts precisely reflect the winning operation
+        var finalClass = await adminClient.GetFromJsonAsync<ClassSummaryResponseDto>($"/classes/{classId}");
+        finalClass.Should().NotBeNull();
+        if (confirmWon)
+        {
+            finalClass!.HeldSeats.Should().Be(0);
+            finalClass.ConfirmedSeats.Should().Be(1);
+            finalClass.AvailableSeats.Should().Be(createdClass.TotalSeats - 1);
+        }
+        else
+        {
+            finalClass!.HeldSeats.Should().Be(0);
+            finalClass.ConfirmedSeats.Should().Be(0);
+            finalClass.AvailableSeats.Should().Be(createdClass.TotalSeats);
+        }
     }
 
     [Fact]
@@ -263,8 +300,17 @@ public sealed class AdmissionSystemIntegrationTests
         var emptyNameResp = await client.PostAsJsonAsync("/classes", new { name = "   ", totalSeats = 50 });
         emptyNameResp.StatusCode.Should().Be(HttpStatusCode.BadRequest);
 
+        var missingNameResp = await client.PostAsJsonAsync("/classes", new { totalSeats = 50 });
+        missingNameResp.StatusCode.Should().Be(HttpStatusCode.BadRequest);
+
         var zeroSeatsResp = await client.PostAsJsonAsync("/classes", new { name = "Valid Name", totalSeats = 0 });
         zeroSeatsResp.StatusCode.Should().Be(HttpStatusCode.BadRequest);
+
+        var negativeSeatsResp = await client.PostAsJsonAsync("/classes", new { name = "Valid Name", totalSeats = -5 });
+        negativeSeatsResp.StatusCode.Should().Be(HttpStatusCode.BadRequest);
+
+        var excessSeatsResp = await client.PostAsJsonAsync("/classes", new { name = "Valid Name", totalSeats = 10001 });
+        excessSeatsResp.StatusCode.Should().Be(HttpStatusCode.BadRequest);
 
         // 2. Malformed JSON -> 400
         using var malformedContent = new StringContent("{ invalid json ", Encoding.UTF8, "application/json");
@@ -306,13 +352,30 @@ public sealed class AdmissionSystemIntegrationTests
         var wrongOwnerCancel = await studentBClient.DeleteAsync($"/holds/{firstHold.HoldId}");
         wrongOwnerCancel.StatusCode.Should().Be(HttpStatusCode.Forbidden);
 
-        // 7. Unknown class / hold ID -> 404
+        // 7. Unknown or invalid class ID -> 404
         var unknownClassResp = await client.GetAsync($"/classes/{Guid.NewGuid()}");
         unknownClassResp.StatusCode.Should().Be(HttpStatusCode.NotFound);
 
         var nonGuidClassResp = await client.GetAsync("/classes/not-a-guid");
         nonGuidClassResp.StatusCode.Should().Be(HttpStatusCode.NotFound);
-        // 8. Verify DATABASE_URL URI parsing (postgres:// and postgresql://) into Npgsql connection string
+
+        var holdOnUnknownClassResp = await studentAClient.PostAsync($"/classes/{Guid.NewGuid()}/holds", content: null);
+        holdOnUnknownClassResp.StatusCode.Should().Be(HttpStatusCode.NotFound);
+
+        // 8. Unknown or invalid hold ID -> 404
+        var unknownHoldResp = await client.GetAsync($"/holds/{Guid.NewGuid()}");
+        unknownHoldResp.StatusCode.Should().Be(HttpStatusCode.NotFound);
+
+        var nonGuidHoldResp = await client.GetAsync("/holds/not-a-valid-guid");
+        nonGuidHoldResp.StatusCode.Should().Be(HttpStatusCode.NotFound);
+
+        var unknownHoldConfirmResp = await studentAClient.PostAsync($"/holds/{Guid.NewGuid()}/confirm", content: null);
+        unknownHoldConfirmResp.StatusCode.Should().Be(HttpStatusCode.NotFound);
+
+        var unknownHoldCancelResp = await studentAClient.DeleteAsync($"/holds/{Guid.NewGuid()}");
+        unknownHoldCancelResp.StatusCode.Should().Be(HttpStatusCode.NotFound);
+
+        // 9. Verify DATABASE_URL URI parsing (postgres:// and postgresql://) into Npgsql connection string
         var parsedUriConn = DependencyInjection.NormalizeConnectionString(
             "postgresql://postgres:secret%40123@db.internal:5433/admission_db?sslmode=Prefer");
         var csb = new NpgsqlConnectionStringBuilder(parsedUriConn);
@@ -341,65 +404,105 @@ public sealed class AdmissionSystemIntegrationTests
                     .Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
                     .Select(u => new Uri(u))
                     .ToArray();
+
+                _output.WriteLine($"[TwoProcessConcurrencyTest] Mode: EXTERNAL_CONFIGURED_URLS");
+                _output.WriteLine($"[TwoProcessConcurrencyTest] Target URLs: {string.Join(", ", urls.Select(u => u.ToString()))}");
+                _output.WriteLine("[TwoProcessConcurrencyTest] Note: External URLs are configured via E2E_API_URLS; verify externally that they run on distinct processes/hosts.");
             }
             else
             {
-                // Spawn two genuinely separate OS processes (dotnet AdmissionSystem.Api.dll) on distinct ports
+                // Spawn two genuinely separate OS processes (dotnet AdmissionSystem.Api.dll) on distinct TCP ports
                 // sharing the exact same PostgreSQL database connection string.
                 spawnedProcess1 = await ExternalApiProcessHandle.StartAsync(_fixture.ConnectionString, holdDurationSeconds: 600);
                 spawnedProcess2 = await ExternalApiProcessHandle.StartAsync(_fixture.ConnectionString, holdDurationSeconds: 600);
                 urls = [spawnedProcess1.BaseUri, spawnedProcess2.BaseUri];
+
+                _output.WriteLine($"[TwoProcessConcurrencyTest] Mode: SPAWNED_LOCAL_PROCESSES");
+                _output.WriteLine($"[TwoProcessConcurrencyTest] Process 1: PID={spawnedProcess1.ProcessId}, Port={spawnedProcess1.Port}, BaseUri={spawnedProcess1.BaseUri}");
+                _output.WriteLine($"[TwoProcessConcurrencyTest] Process 2: PID={spawnedProcess2.ProcessId}, Port={spawnedProcess2.Port}, BaseUri={spawnedProcess2.BaseUri}");
+                _output.WriteLine($"[TwoProcessConcurrencyTest] Shared Database: {_fixture.ConnectionString}");
             }
 
             urls.Length.Should().BeGreaterThanOrEqualTo(2, "Two separate backend process URLs are required.");
             urls[0].Port.Should().NotBe(urls[1].Port);
 
-            using var client1 = new HttpClient { BaseAddress = urls[0] };
-            using var client2 = new HttpClient { BaseAddress = urls[1] };
-
-            const int totalSeats = 10;
-            const int concurrentRequests = 100;
-            var uniqueClassName = $"MultiProcess-Class-{Guid.NewGuid():N}";
-
-            var createResp = await client1.PostAsJsonAsync("/classes", new
+            var clients = urls.Select(u => new HttpClient { BaseAddress = u }).ToArray();
+            try
             {
-                name = uniqueClassName,
-                totalSeats
-            });
-            createResp.StatusCode.Should().Be(HttpStatusCode.Created);
-            var createdClass = await createResp.Content.ReadFromJsonAsync<ClassSummaryResponseDto>();
-            var classId = createdClass!.Id;
+                const int totalSeats = 10;
+                const int concurrentRequests = 100;
+                var uniqueClassName = $"MultiProcess-Class-{Guid.NewGuid():N}";
 
-            using var barrier = new SemaphoreSlim(0, concurrentRequests);
-
-            var tasks = Enumerable.Range(1, concurrentRequests)
-                .Select(async index =>
+                var createResp = await clients[0].PostAsJsonAsync("/classes", new
                 {
-                    var targetUrl = urls[index % urls.Length];
-                    var studentId = (20160000000000000L + index).ToString();
+                    name = uniqueClassName,
+                    totalSeats
+                });
+                createResp.StatusCode.Should().Be(HttpStatusCode.Created);
+                var createdClass = await createResp.Content.ReadFromJsonAsync<ClassSummaryResponseDto>();
+                var classId = createdClass!.Id;
 
-                    using var req = new HttpRequestMessage(HttpMethod.Post, new Uri(targetUrl, $"/classes/{classId}/holds"));
-                    req.Headers.Add("X-Student-Id", studentId);
+                using var barrier = new SemaphoreSlim(0, concurrentRequests);
 
-                    var targetClient = index % 2 == 0 ? client1 : client2;
-                    await barrier.WaitAsync();
-                    return await targetClient.SendAsync(req);
-                })
-                .ToArray();
+                // Consistently select target client and target URL using the exact same index.
+                var tasks = Enumerable.Range(1, concurrentRequests)
+                    .Select(async index =>
+                    {
+                        var targetIndex = index % urls.Length;
+                        var targetClient = clients[targetIndex];
+                        var studentId = (20160000000000000L + index).ToString();
 
-            barrier.Release(concurrentRequests);
-            var responses = await Task.WhenAll(tasks);
+                        using var req = new HttpRequestMessage(HttpMethod.Post, $"/classes/{classId}/holds");
+                        req.Headers.Add("X-Student-Id", studentId);
 
-            var createdCount = responses.Count(r => r.StatusCode == HttpStatusCode.Created);
-            var conflictCount = responses.Count(r => r.StatusCode == HttpStatusCode.Conflict);
+                        await barrier.WaitAsync();
+                        return await targetClient.SendAsync(req);
+                    })
+                    .ToArray();
 
-            createdCount.Should().Be(totalSeats);
-            conflictCount.Should().Be(concurrentRequests - totalSeats);
+                barrier.Release(concurrentRequests);
+                var responses = await Task.WhenAll(tasks);
 
-            var summaryFromInstance2 = await client2.GetFromJsonAsync<ClassSummaryResponseDto>($"/classes/{classId}");
-            summaryFromInstance2!.HeldSeats.Should().Be(totalSeats);
-            summaryFromInstance2.AvailableSeats.Should().Be(0);
-            (summaryFromInstance2.HeldSeats + summaryFromInstance2.ConfirmedSeats).Should().BeLessThanOrEqualTo(totalSeats);
+                // Strengthened assertions: exactly 100 responses and strictly 201 or 409
+                responses.Length.Should().Be(concurrentRequests, "Exactly 100 HTTP responses must be received.");
+
+                var unexpectedErrors = new List<string>();
+                foreach (var r in responses)
+                {
+                    if (r.StatusCode != HttpStatusCode.Created && r.StatusCode != HttpStatusCode.Conflict)
+                    {
+                        var body = await r.Content.ReadAsStringAsync();
+                        unexpectedErrors.Add($"{r.StatusCode}: {body}");
+                    }
+                }
+
+                if (unexpectedErrors.Count > 0)
+                {
+                    _output.WriteLine($"[TwoProcessConcurrencyTest] Unexpected responses: {string.Join(" | ", unexpectedErrors)}");
+                }
+
+                responses.Should().OnlyContain(
+                    r => r.StatusCode == HttpStatusCode.Created || r.StatusCode == HttpStatusCode.Conflict,
+                    $"Every response must be either 201 Created or 409 Conflict, but unexpected were: {string.Join(", ", unexpectedErrors)}");
+
+                var createdCount = responses.Count(r => r.StatusCode == HttpStatusCode.Created);
+                var conflictCount = responses.Count(r => r.StatusCode == HttpStatusCode.Conflict);
+
+                createdCount.Should().Be(totalSeats, "Exactly totalSeats (10) hold requests must succeed.");
+                conflictCount.Should().Be(concurrentRequests - totalSeats, "All excess requests (90) must receive 409 Conflict.");
+
+                var summaryFromInstance2 = await clients[1].GetFromJsonAsync<ClassSummaryResponseDto>($"/classes/{classId}");
+                summaryFromInstance2!.HeldSeats.Should().Be(totalSeats);
+                summaryFromInstance2.AvailableSeats.Should().Be(0);
+                (summaryFromInstance2.HeldSeats + summaryFromInstance2.ConfirmedSeats).Should().BeLessThanOrEqualTo(totalSeats);
+            }
+            finally
+            {
+                foreach (var c in clients)
+                {
+                    c.Dispose();
+                }
+            }
         }
         finally
         {

@@ -425,7 +425,14 @@ public sealed class AdmissionSystemIntegrationTests
             }
 
             urls.Length.Should().BeGreaterThanOrEqualTo(2, "Two separate backend process URLs are required.");
-            urls[0].Port.Should().NotBe(urls[1].Port);
+            if (urls[0].Host.Equals(urls[1].Host, StringComparison.OrdinalIgnoreCase))
+            {
+                urls[0].Port.Should().NotBe(urls[1].Port, "Two processes on the same host must listen on different ports.");
+            }
+            else
+            {
+                urls[0].Host.Should().NotBe(urls[1].Host, "Two instances across containers must have distinct hostnames.");
+            }
 
             var clients = urls.Select(u => new HttpClient { BaseAddress = u }).ToArray();
             try

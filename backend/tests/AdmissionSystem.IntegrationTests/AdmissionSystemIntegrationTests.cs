@@ -417,10 +417,11 @@ public sealed class AdmissionSystemIntegrationTests
                 spawnedProcess2 = await ExternalApiProcessHandle.StartAsync(_fixture.ConnectionString, holdDurationSeconds: 600);
                 urls = [spawnedProcess1.BaseUri, spawnedProcess2.BaseUri];
 
+                var dbCsb = new NpgsqlConnectionStringBuilder(_fixture.ConnectionString);
                 _output.WriteLine($"[TwoProcessConcurrencyTest] Mode: SPAWNED_LOCAL_PROCESSES");
                 _output.WriteLine($"[TwoProcessConcurrencyTest] Process 1: PID={spawnedProcess1.ProcessId}, Port={spawnedProcess1.Port}, BaseUri={spawnedProcess1.BaseUri}");
                 _output.WriteLine($"[TwoProcessConcurrencyTest] Process 2: PID={spawnedProcess2.ProcessId}, Port={spawnedProcess2.Port}, BaseUri={spawnedProcess2.BaseUri}");
-                _output.WriteLine($"[TwoProcessConcurrencyTest] Shared Database: {_fixture.ConnectionString}");
+                _output.WriteLine($"[TwoProcessConcurrencyTest] Shared Database: Host={dbCsb.Host};Port={dbCsb.Port};Database={dbCsb.Database}");
             }
 
             urls.Length.Should().BeGreaterThanOrEqualTo(2, "Two separate backend process URLs are required.");
@@ -479,6 +480,14 @@ public sealed class AdmissionSystemIntegrationTests
                 if (unexpectedErrors.Count > 0)
                 {
                     _output.WriteLine($"[TwoProcessConcurrencyTest] Unexpected responses: {string.Join(" | ", unexpectedErrors)}");
+                    if (spawnedProcess1 is not null)
+                    {
+                        _output.WriteLine($"[TwoProcessConcurrencyTest] Process 1 StdErr: {spawnedProcess1.GetStdErr()}");
+                    }
+                    if (spawnedProcess2 is not null)
+                    {
+                        _output.WriteLine($"[TwoProcessConcurrencyTest] Process 2 StdErr: {spawnedProcess2.GetStdErr()}");
+                    }
                 }
 
                 responses.Should().OnlyContain(

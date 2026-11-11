@@ -22,6 +22,22 @@ public sealed class ExternalApiProcessHandle : IAsyncDisposable
     public int ProcessId => _process.Id;
     public int Port => BaseUri.Port;
 
+    public string GetStdOut()
+    {
+        lock (_outputLock)
+        {
+            return _stdoutBuffer.ToString();
+        }
+    }
+
+    public string GetStdErr()
+    {
+        lock (_outputLock)
+        {
+            return _stderrBuffer.ToString();
+        }
+    }
+
     private ExternalApiProcessHandle(Process process, Uri baseUri)
     {
         _process = process;
@@ -56,10 +72,9 @@ public sealed class ExternalApiProcessHandle : IAsyncDisposable
 
     public static async Task<ExternalApiProcessHandle> StartAsync(
         string connectionString,
-        int holdDurationSeconds = 600)
+        int holdDurationSeconds = 600,
+        int maxAttempts = 3)
     {
-        var port = GetFreeTcpPort();
-        var baseUri = new Uri($"http://127.0.0.1:{port}");
         var apiDllPath = Path.Combine(AppContext.BaseDirectory, "AdmissionSystem.Api.dll");
 
         if (!File.Exists(apiDllPath))
@@ -67,36 +82,54 @@ public sealed class ExternalApiProcessHandle : IAsyncDisposable
             throw new FileNotFoundException($"Could not locate '{apiDllPath}' to start external API process.");
         }
 
-        var psi = new ProcessStartInfo("dotnet", $"\"{apiDllPath}\" --urls {baseUri}")
+        Exception? lastException = null;
+
+        for (var attempt = 1; attempt <= maxAttempts; attempt++)
         {
-            WorkingDirectory = AppContext.BaseDirectory,
-            UseShellExecute = false,
-            RedirectStandardOutput = true,
-            RedirectStandardError = true,
-            CreateNoWindow = true
-        };
+            var port = GetFreeTcpPort();
+            var baseUri = new Uri($"http://127.0.0.1:{port}");
 
-        psi.Environment["ASPNETCORE_ENVIRONMENT"] = "Production";
-        psi.Environment["ConnectionStrings__Default"] = connectionString;
-        psi.Environment["HOLD_DURATION_SECONDS"] = holdDurationSeconds.ToString();
-        psi.Environment["SKIP_MIGRATIONS"] = "true";
-        // Budget 40 connections per API process to keep 2 processes + runner within PostgreSQL 100 max_connections
-        psi.Environment["MAX_POOL_SIZE"] = "40";
+            var psi = new ProcessStartInfo("dotnet", $"\"{apiDllPath}\" --urls {baseUri}")
+            {
+                WorkingDirectory = AppContext.BaseDirectory,
+                UseShellExecute = false,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                CreateNoWindow = true
+            };
 
-        var process = Process.Start(psi)
-            ?? throw new InvalidOperationException("Failed to start external dotnet API process.");
+            psi.Environment["ASPNETCORE_ENVIRONMENT"] = "Production";
+            psi.Environment["ConnectionStrings__Default"] = connectionString;
+            psi.Environment["HOLD_DURATION_SECONDS"] = holdDurationSeconds.ToString();
+            psi.Environment["SKIP_MIGRATIONS"] = "true";
+            // Budget 35 connections per API process to keep 2 processes + runner comfortably within PostgreSQL 100 max_connections
+            psi.Environment["MAX_POOL_SIZE"] = "35";
 
-        var handle = new ExternalApiProcessHandle(process, baseUri);
-        try
-        {
-            await handle.WaitForHealthyAsync(TimeSpan.FromSeconds(20));
-            return handle;
+            var process = Process.Start(psi)
+                ?? throw new InvalidOperationException("Failed to start external dotnet API process.");
+
+            var handle = new ExternalApiProcessHandle(process, baseUri);
+            try
+            {
+                await handle.WaitForHealthyAsync(TimeSpan.FromSeconds(20));
+                return handle;
+            }
+            catch (Exception ex)
+            {
+                lastException = ex;
+                await handle.DisposeAsync();
+
+                if (attempt < maxAttempts)
+                {
+                    // Brief delay before retrying with another ephemeral port to handle potential port race conditions
+                    await Task.Delay(250);
+                }
+            }
         }
-        catch
-        {
-            await handle.DisposeAsync();
-            throw;
-        }
+
+        throw new InvalidOperationException(
+            $"External API process failed to start and become healthy after {maxAttempts} attempts.",
+            lastException);
     }
 
     private async Task WaitForHealthyAsync(TimeSpan timeout)
@@ -161,7 +194,9 @@ public sealed class ExternalApiProcessHandle : IAsyncDisposable
     {
         using var listener = new TcpListener(IPAddress.Loopback, 0);
         listener.Start();
-        return ((IPEndPoint)listener.LocalEndpoint).Port;
+        var port = ((IPEndPoint)listener.LocalEndpoint).Port;
+        listener.Stop();
+        return port;
     }
 }
 

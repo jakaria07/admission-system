@@ -124,7 +124,7 @@ public static class DependencyInjection
         // PostgreSQL's default max_connections is 100 (97 usable by non-superusers).
         // For standard single-instance deployments, Npgsql's default MaxPoolSize (100) is preserved.
         // For multi-process deployments sharing one DB (e.g. 2 API processes + test runner),
-        // each process should budget ~40 connections (40 + 40 + 15 = 95 <= 100) to prevent
+        // each process should budget ~35 connections (35 + 35 + 15 = 85 <= 97) to prevent
         // 'sorry, too many clients already' connection exhaustion.
         // We only apply defaultMaxPoolSize if explicitly requested and the connection string did not specify one.
         if (!hasExplicitPoolSize && defaultMaxPoolSize.HasValue && defaultMaxPoolSize.Value > 0)

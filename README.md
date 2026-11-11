@@ -96,7 +96,7 @@ docker compose down
 | **Frontend Portal (UI)** | [http://localhost:5173](http://localhost:5173) | School Admin & Guardian Admission Portal |
 | **Backend API (Instance 1)** | [http://localhost:8080](http://localhost:8080) | Primary REST API (`GET /health` for health check) |
 | **Backend API (Instance 2)** | [http://localhost:8081](http://localhost:8081) | Secondary REST API sharing the same PostgreSQL DB |
-| **PostgreSQL 17** | `localhost:5433` | Host port `5433` -> Container port `5432` (`postgres` / `postgres`, DB: `admission_db`) |
+| **PostgreSQL 17** | `localhost:5433` | Host port `5433` -> Container port `5432` (DB: `admission_db`; uses `postgres` / `postgres` as local assignment/demo defaults only) |
 
 ---
 
@@ -177,9 +177,11 @@ Common error codes (`ErrorCodes`):
 | `POSTGRES_PORT` | `5433` | Host port mapped to container PostgreSQL port `5432`. |
 | `FRONTEND_PORT` | `5173` | Host port mapped to container Nginx port `5173`. |
 
+> **Security Note:** The default database credentials (`postgres` / `postgres`) in `docker-compose.yml` are provided strictly for zero-configuration local assignment evaluation and demo convenience. They are **not** production credentials; in any real deployment, credentials must be supplied via secure environment secrets.
+
 ---
 
-## 8. Running Automated Integration & Concurrency Tests
+## 8. Running Automated Integration & Concurrency Tests (and Frontend Build)
 
 The test suite (`backend/tests/AdmissionSystem.IntegrationTests`) contains **6 comprehensive integration tests** covering:
 1. **Single-Instance Concurrency:** 100 simultaneous requests for a 10-seat class -> exactly `10 × 201 Created` and `90 × 409 Conflict` (`NO_SEATS`).
@@ -203,4 +205,14 @@ When run locally, the test suite automatically provisions a PostgreSQL 17 contai
 cd backend
 dotnet test --logger "console;verbosity=normal"
 ```
+
+### Option C: Verify Frontend TypeScript & Production Build Locally
+To run the TypeScript compiler check (`tsc -b`) and Vite production bundle build (`vite build`) outside Docker:
+
+```bash
+cd frontend
+npm ci
+npm run build
+```
+
 

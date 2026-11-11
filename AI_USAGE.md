@@ -50,11 +50,7 @@ Every issue listed below was caught during testing or PR review and fixed in our
 - **What went wrong:** The hold expiry integration test (`HoldExpiry_WaitPastExpiry_HoldBecomesExpired_SeatReturns_ConfirmFails409_StudentCanReapply`) initially used a fixed `await Task.Delay(2600)` for a 2-second hold.
 - **How it was verified & fixed:** Replaced the fixed delay with a deadline-based polling helper (`WaitForHoldExpirationAsync`) that polls `GET /holds/{id}` every `150ms` up to a 10-second timeout until `status == "EXPIRED"`, making the test both faster and resilient to CI scheduling jitter.
 
-### 6. Missing `curl` in `.NET 10` Runtime Image & Container Hostname Assertion (`PR #2`)
-- **What went wrong:**
-  1. The `api` healthcheck in `docker-compose.yml` initially used `curl -f http://localhost:8080/health`, which failed because `mcr.microsoft.com/dotnet/aspnet:10.0` (Debian slim/Ubuntu noble) does not ship with `curl` pre-installed.
-  2. In Docker Compose, `E2E_API_URLS` was set to `http://api:8080,http://api-2:8080`. The two-instance test initially asserted `uri0.Port != uri1.Port`, which worked for local processes (`localhost:port1` vs `localhost:port2`) but failed when two distinct containers used the same internal container port `8080`.
-- **How it was verified & fixed:**
-  1. Switched the runtime base image in `backend/Dockerfile` to `mcr.microsoft.com/dotnet/aspnet:10.0-alpine` (which includes BusyBox `wget` out of the box) and updated the healthcheck to `wget -q --spider http://localhost:8080/health || exit 1`.
-  2. Updated the endpoint distinctness assertion in `AdmissionSystemIntegrationTests.cs` to require different ports when both URLs share the same host, and allow the same internal port when the URLs target different container hostnames (`api` vs `api-2`).
+### 6. Container Hostname vs. Port Assertion in Two-Instance E2E Test (`PR #2`)
+- **What went wrong:** In the initial committed version of the two-instance concurrency test (`AdmissionSystemIntegrationTests.cs`), the test asserted `uri0.Port != uri1.Port` to verify that the two backend endpoints were distinct. While this passed when spawning two local processes on different localhost ports (`localhost:port1` vs `localhost:port2`), it failed in Docker Compose (`PR #2`) where `E2E_API_URLS` was configured as `http://api:8080,http://api-2:8080` (two distinct container hostnames listening on the same internal container port `8080`).
+- **How it was verified & fixed:** Caught when running `docker compose --profile test run --rm tests` in `PR #2`. Updated the endpoint distinctness assertion in `AdmissionSystemIntegrationTests.cs` to require different ports when both URLs share the same host, and allow the same internal port when the URLs target different container hostnames (`api` vs `api-2`).
 
